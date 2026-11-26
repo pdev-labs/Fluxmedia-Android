@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: FluxMedia Python project
+    url: https://github.com/pdev-labs/FluxMedia/issues
+    about: Report engine, extractor or desktop/CLI issues in the main repository.
+  - name: Security report
+    url: https://github.com/pdev-labs/Fluxmedia-Android/security/advisories/new
+    about: Report vulnerabilities privately.

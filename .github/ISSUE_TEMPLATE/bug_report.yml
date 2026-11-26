@@ -1,0 +1,69 @@
+name: Bug report
+description: Report a crash, a failed download or a UI problem in the Android app.
+title: "[Bug]: "
+labels: ["bug", "beta"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing the FluxMedia Android beta. Please search existing
+        issues first, and remove any private links or file paths before posting.
+  - type: input
+    id: app-version
+    attributes:
+      label: App version
+      description: Shown on the About screen (for example 1.0.0).
+      placeholder: "1.0.0"
+    validations:
+      required: true
+  - type: input
+    id: device
+    attributes:
+      label: Device and Android version
+      placeholder: "Pixel 8, Android 15"
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Where did it happen?
+      options:
+        - Download / analysis
+        - Library
+        - Settings / appearance
+        - Health / diagnostics
+        - About
+        - Install / signing
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open Download
+        2. Paste ...
+        3. Tap ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened instead?
+      description: Include the error text and, if possible, the log from the Health screen.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or screenshots
+      description: Drag screenshots here, or paste `adb logcat` output filtered by `com.fluxmedia.app`.
+    validations:
+      required: false

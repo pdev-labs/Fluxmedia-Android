@@ -1,0 +1,43 @@
+name: Feature request
+description: Suggest a feature or improvement for the Android app.
+title: "[Feature]: "
+labels: ["enhancement", "beta"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The app is still in beta, so small, focused suggestions are easiest to
+        act on. Please check the roadmap in the main FluxMedia repository first.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      placeholder: "I want to ... but currently ..."
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      placeholder: "Add a setting that ..."
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Download
+        - Library
+        - Settings / appearance
+        - Health
+        - Notifications / background work
+        - Other
+    validations:
+      required: true
