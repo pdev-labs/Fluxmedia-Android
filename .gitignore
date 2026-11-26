@@ -1,0 +1,17 @@
+# Gradle / Android build outputs
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.idea/
+*.iml
+
+# Built packages
+*.apk
+*.aab
+*.jks
+*.p12
+
+# Python
+__pycache__/
+*.pyc

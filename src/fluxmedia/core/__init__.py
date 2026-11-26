@@ -1,0 +1,1103 @@
+
+import datetime
+import yt_dlp
+from rich.markup import escape
+
+import os
+from importlib.metadata import version, PackageNotFoundError
+
+try:
+    CURRENT_VERSION = version("fluxmedia")
+except PackageNotFoundError:
+    CURRENT_VERSION = "unknown"
+
+
+
+# Proxy functions to resolve circular dependencies at module level
+def print_header(*args, **kwargs):
+    from fluxmedia.cli.main import print_header as _ph
+    return _ph(*args, **kwargs)
+
+def operation_update_fluxmedia(*args, **kwargs):
+    from fluxmedia.cli.main import operation_update_fluxmedia as _upd
+    return _upd(*args, **kwargs)
+
+def prompt_video_quality(*args, **kwargs):
+    from fluxmedia.downloader.utils import prompt_video_quality as _pvq
+    return _pvq(*args, **kwargs)
+
+def get_format_string(*args, **kwargs):
+    from fluxmedia.downloader.utils import get_format_string as _gfs
+    return _gfs(*args, **kwargs)
+
+def apply_common_ydl_opts(*args, **kwargs):
+    from fluxmedia.downloader.core import apply_common_ydl_opts as _aco
+    return _aco(*args, **kwargs)
+
+def run_ydl_download(*args, **kwargs):
+    from fluxmedia.downloader.core import run_ydl_download as _ryd
+    return _ryd(*args, **kwargs)
+
+
+import platform
+
+def get_data_dir():
+    # Embedded Android builds set this before importing fluxmedia.core.
+    override = os.environ.get("FLUXMEDIA_DATA_DIR")
+    if override:
+        return os.path.abspath(os.path.expanduser(override))
+    if platform.system() == "Windows":
+        return os.path.join(os.environ.get("APPDATA", ""), "FluxMedia")
+    elif platform.system() == "Darwin":
+        return os.path.expanduser("~/Library/Application Support/FluxMedia")
+    else:
+        return os.path.expanduser("~/.local/share/FluxMedia")
+
+DATA_DIR = get_data_dir()
+os.makedirs(DATA_DIR, exist_ok=True)
+
+CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
+HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
+QUEUE_FILE = os.path.join(DATA_DIR, "queue.json")
+LOG_FILE = os.path.join(DATA_DIR, "fluxmedia.log")
+LOG_DIR = os.path.join(DATA_DIR, "logs")
+THUMB_CACHE_DIR = os.path.join(DATA_DIR, "thumb_cache")
+os.makedirs(THUMB_CACHE_DIR, exist_ok=True)
+
+# Session log retention: per-launch files fluxmedia-YYYYMMDD-HHMMSS.log.
+KEEP_SESSION_LOGS = 14
+LOG_LINE_FORMAT = "%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s"
+
+
+def get_log_files():
+    """Newest-first list of session logs: [{path, mtime, size}]."""
+    files = []
+    try:
+        names = os.listdir(LOG_DIR)
+    except OSError:
+        return files
+    for name in names:
+        if name.startswith("fluxmedia-") and name.endswith(".log"):
+            path = os.path.join(LOG_DIR, name)
+            try:
+                st = os.stat(path)
+                files.append({"path": path, "mtime": st.st_mtime, "size": st.st_size})
+            except OSError:
+                pass
+    files.sort(key=lambda x: x["mtime"], reverse=True)
+    return files
+
+
+def current_log_file():
+    """Active session log path, else legacy file, else empty string."""
+    files = get_log_files()
+    if files:
+        return files[0]["path"]
+    if os.path.isfile(LOG_FILE):
+        return LOG_FILE
+    return ""
+
+
+def setup_file_logging():
+    """Starts a new timestamped session log and prunes old ones.
+
+    Attaches a single parser-compatible handler to the ROOT logger
+    (guarded against duplicates) and repoints LOG_FILE at the new file.
+    Returns the session log path.
+    """
+    global LOG_FILE
+    os.makedirs(LOG_DIR, exist_ok=True)
+    for old in get_log_files()[KEEP_SESSION_LOGS:]:
+        try:
+            os.remove(old["path"])
+        except OSError:
+            pass
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    path = os.path.join(LOG_DIR, f"fluxmedia-{stamp}.log")
+    n = 1
+    while os.path.exists(path):
+        n += 1
+        path = os.path.join(LOG_DIR, f"fluxmedia-{stamp}-{n}.log")
+    try:
+        already = [h for h in logging.getLogger().handlers
+                   if isinstance(h, logging.FileHandler)
+                   and os.path.abspath(getattr(h, "baseFilename", "")) == os.path.abspath(path)]
+        if not already:
+            fh = logging.FileHandler(path, encoding="utf-8")
+            fh.setLevel(logging.INFO)
+            fh.setFormatter(logging.Formatter(LOG_LINE_FORMAT))
+            logging.getLogger().addHandler(fh)
+            logging.getLogger().setLevel(logging.INFO)
+        # Keep uvicorn chatter out of our file (it has its own handlers).
+        for noisy in ("uvicorn", "uvicorn.access", "uvicorn.error"):
+            try:
+                logging.getLogger(noisy).propagate = False
+            except Exception:
+                pass
+    except Exception:
+        pass
+    LOG_FILE = path
+    return path
+
+import os
+import sys
+import json
+import time
+import shutil
+import socket
+import subprocess
+import urllib.parse
+from typing import Any, Dict, List, Optional, Union
+from rich.console import Console
+from rich.prompt import Prompt, Confirm
+from rich.table import Table
+from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeRemainingColumn
+import threading
+import urllib.request
+import requests
+import logging
+
+logger = logging.getLogger(__name__)
+
+console = Console()
+
+from fluxmedia.utils import *
+
+def get_install_info() -> Dict[str, Any]:
+    """Detects how FluxMedia is installed: pipx | editable | venv | system | source | unknown.
+
+    Used by --doctor and by the updater to run (or suggest) the correct
+    upgrade command instead of blindly pip-installing.
+    """
+    info: Dict[str, Any] = {
+        "method": "unknown",
+        "binary": shutil.which("fluxmedia") or "",
+        "python": sys.version.split()[0],
+        "python_path": sys.executable,
+        "in_venv": sys.prefix != getattr(sys, "base_prefix", sys.prefix),
+    }
+    try:
+        import fluxmedia
+        pkg_file = getattr(fluxmedia, "__file__", "") or ""
+        info["package_path"] = pkg_file
+        # Source checkout (repo with .git above the package)?
+        probe = os.path.dirname(os.path.abspath(pkg_file))
+        for _ in range(4):
+            if os.path.isdir(os.path.join(probe, ".git")):
+                info["method"] = "editable"
+                info["source_dir"] = probe
+                break
+            probe = os.path.dirname(probe)
+        if info["method"] == "unknown":
+            if "pipx" in sys.prefix:
+                info["method"] = "pipx"
+            else:
+                try:
+                    dist = distribution("fluxmedia")
+                    direct = dist.read_text("direct_url.json")
+                    if direct:
+                        import json as _json
+                        parsed = _json.loads(direct)
+                        if parsed.get("dir_info", {}).get("editable"):
+                            info["method"] = "editable"
+                        else:
+                            info["method"] = "pip"
+                    else:
+                        info["method"] = "venv" if info["in_venv"] else "system"
+                except PackageNotFoundError:
+                    info["method"] = "source" if info.get("source_dir") else "unknown"
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return info
+
+
+TRACKING_PARAMS = frozenset({
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+    "utm_id", "fbclid", "gclid", "dclid", "msclkid", "mc_cid", "mc_eid",
+    "igshid", "spm", "ref", "ref_src", "ref_url", "si", "si_param",
+    "feature", "embeds_referring_euri",
+})
+
+YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com",
+                 "music.youtube.com", "youtu.be", "www.youtu.be"}
+
+
+def parse_subtitle_langs(value) -> list:
+    """Parses 'en, es, pt-BR' style input into ['en', 'es', 'pt-BR'].
+
+    Keeps 2-3 letter codes with optional -XX region; anything else falls
+    back to ['en'] so a typo never silently disables subtitles.
+    """
+    try:
+        parts = str(value or "").replace(";", ",").split(",")
+    except Exception:
+        return ["en"]
+    import re as _re
+    langs = []
+    for part in parts:
+        code = part.strip()
+        if _re.fullmatch(r"[a-z]{2,3}(-[A-Z]{2})?", code) and code not in langs:
+            langs.append(code)
+    return langs or ["en"]
+
+
+
+def normalize_url(url: str) -> str:
+    """Canonical form for duplicate comparison.
+
+    Lowercases scheme/host, drops fragments and tracking params, sorts the
+    remaining query, and collapses YouTube variants (youtu.be, /shorts/,
+    /embed/, /live/, /v/) to watch?v=<id>. Returns "" for unparseable input.
+    """
+    try:
+        raw = (url or "").strip()
+        if not raw:
+            return ""
+        if "://" not in raw:
+            raw = "https://" + raw
+        parts = urllib.parse.urlsplit(raw)
+        scheme = (parts.scheme or "https").lower()
+        host = (parts.hostname or "").lower()
+        if not host:
+            return ""
+        port = parts.port
+        if port and not ((scheme == "https" and port == 443) or (scheme == "http" and port == 80)):
+            host = f"{host}:{port}"
+        path = parts.path or "/"
+        query = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+
+        if host in YOUTUBE_HOSTS:
+            vid = ""
+            if host in ("youtu.be", "www.youtu.be"):
+                vid = path.strip("/").split("/")[0]
+            else:
+                q = dict(query)
+                vid = q.get("v", "")
+                if not vid:
+                    segs = [s for s in path.split("/") if s]
+                    if len(segs) >= 2 and segs[0] in ("shorts", "embed", "live", "v"):
+                        vid = segs[1]
+            if vid:
+                return f"https://www.youtube.com/watch?v={vid}"
+            # No video id (channel/playlist/home): generic handling below.
+
+        kept = sorted((k, v) for k, v in query
+                      if k not in TRACKING_PARAMS and not k.startswith("utm_"))
+        qs = urllib.parse.urlencode(kept, doseq=True)
+        norm_path = path if path != "/" else "/"
+        if len(norm_path) > 1:
+            norm_path = norm_path.rstrip("/")
+        out = f"{scheme}://{host}{norm_path}"
+        return f"{out}?{qs}" if qs else out
+    except Exception:
+        return (url or "").strip()
+
+
+def find_duplicate(url: str, history=None, queue=None):
+    """Returns {"where": "history"|"queue", "entry": dict} for a previously
+    seen URL, else None. Compares normalized forms, so youtu.be links,
+    /shorts/ paths and tracking parameters match the original download."""
+    want = normalize_url(url)
+    if not want:
+        return None
+    try:
+        items = list(history) if history is not None else load_history()
+    except Exception:
+        items = []
+    for entry in items:
+        try:
+            if isinstance(entry, dict) and normalize_url(entry.get("url", "")) == want:
+                return {"where": "history", "entry": entry}
+        except Exception:
+            continue
+    try:
+        pending = list(queue) if queue is not None else load_queue()
+    except Exception:
+        pending = []
+    for entry in pending:
+        try:
+            if isinstance(entry, dict) and entry.get("status") == "Pending" \
+                    and normalize_url(entry.get("url", "")) == want:
+                return {"where": "queue", "entry": entry}
+        except Exception:
+            continue
+    return None
+
+
+def search_entries(entries, query, fields):
+    """Case-insensitive substring filter over the given dict fields.
+
+    Returns all entries when the query is empty. Never raises.
+    """
+    try:
+        q = (query or "").strip().lower()
+    except Exception:
+        return list(entries or [])
+    if not q:
+        return list(entries or [])
+    out = []
+    for entry in entries or []:
+        try:
+            hay = " ".join(str(entry.get(f, "")) for f in fields).lower()
+        except Exception:
+            continue
+        if q in hay:
+            out.append(entry)
+    return out
+
+
+def notify_event(kind: str, title: str, message: str, config=None) -> bool:
+    """User-configured notifications for download outcomes.
+
+    kind: "complete" | "failed". Honors notify_on (both/complete/failed/
+    never) and optionally POSTs to an ntfy.sh-style webhook (ntfy_url).
+    Never raises; returns True if any channel was attempted.
+    """
+    try:
+        cfg = config if isinstance(config, dict) else {}
+        mode = str(cfg.get("notify_on", "both")).lower()
+        if mode == "never":
+            return False
+        if mode == "complete" and kind != "complete":
+            return False
+        if mode == "failed" and kind != "failed":
+            return False
+        attempted = False
+        try:
+            from fluxmedia.utils import send_desktop_notification as _notify
+            _notify(title, message)
+            attempted = True
+        except Exception:
+            pass
+        webhook = str(cfg.get("ntfy_url", "") or "").strip()
+        if webhook:
+            try:
+                import urllib.request as _req
+                import urllib.parse as _up
+                # Only http(s) webhooks: urlopen with file:/custom schemes is unexpected.
+                if _up.urlsplit(webhook).scheme not in ("http", "https"):
+                    return attempted
+                data = message.encode("utf-8", "replace")[:4000]
+                r = _req.Request(webhook, data=data, method="POST",
+                                 headers={"Title": title[:200], "Priority": "default"})
+                with _req.urlopen(r, timeout=5):  # nosec B310
+                    pass
+                attempted = True
+            except Exception:
+                pass
+        return attempted
+    except Exception:
+        return False
+
+
+def is_new_version_available(current: str, latest: Optional[str]) -> bool:
+    """Helper to check if a new version is actually available using semver comparison."""
+    if not latest:
+        return False
+    try:
+        def parse_parts(v_str):
+            cleaned = v_str.split("-")[0].split("+")[0]
+            parts = []
+            for p in cleaned.split("."):
+                num_str = "".join(ch for ch in p if ch.isdigit())
+                parts.append(int(num_str) if num_str else 0)
+            return parts
+
+        c_parts = parse_parts(current)
+        l_parts = parse_parts(latest)
+        
+        max_len = max(len(c_parts), len(l_parts))
+        c_parts += [0] * (max_len - len(c_parts))
+        l_parts += [0] * (max_len - len(l_parts))
+        
+        return l_parts > c_parts
+    except Exception:
+        return latest != current
+
+def check_pypi_version_async():
+    """Checks PyPI in a background thread for the latest FluxMedia version."""
+    global LATEST_VERSION
+    try:
+        url = "https://pypi.org/pypi/fluxmedia/json"
+        response = requests.get(url, timeout=2.0)
+        if response.status_code == 200:
+            data = response.json()
+            LATEST_VERSION = data.get("info", {}).get("version")
+    except Exception:
+        pass
+
+def start_version_check():
+    """Starts the background thread for version checking."""
+    thread = threading.Thread(target=check_pypi_version_async, daemon=True)
+    thread.start()
+
+# Update-check intervals in seconds (None = never check).
+UPDATE_INTERVALS = {
+    "daily": 24 * 3600,
+    "weekly": 7 * 24 * 3600,
+    "monthly": 30 * 24 * 3600,
+    "never": None,
+}
+
+
+def should_check_for_updates(config: Dict[str, Any]) -> bool:
+    """True when a PyPI version check is due under the configured interval.
+
+    Honors the (previously unused) auto_update master switch: False means
+    never check. Unknown interval values fall back to weekly.
+    """
+    if not config.get("auto_update", True):
+        return False
+    interval = UPDATE_INTERVALS.get(str(config.get("update_interval", "weekly")), UPDATE_INTERVALS["weekly"])
+    if interval is None:
+        return False
+    try:
+        last = float(config.get("last_update_check", 0) or 0)
+    except (TypeError, ValueError):
+        last = 0
+    import time as _time
+    return (_time.time() - last) >= interval
+
+def is_version_ignored(version: Optional[str], config: Dict[str, Any]) -> bool:
+    """True when the user dismissed this exact version via 'Ignore this version'."""
+    if not version:
+        return False
+    ignored = config.get("ignored_versions", [])
+    return version in ignored if isinstance(ignored, list) else False
+
+def check_fluxmedia_update_sync(config: Dict[str, Any]):
+    """Checks PyPI synchronously for the latest FluxMedia version on start and prompts for update.
+
+    Skips silently when the configured update interval has not elapsed;
+    stamps last_update_check on every attempt so offline machines are not
+    hammered on each launch.
+    """
+    if not should_check_for_updates(config):
+        return
+    import time as _time
+    config["last_update_check"] = _time.time()
+    try:
+        save_config(config)
+    except Exception:
+        pass
+    global LATEST_VERSION
+    console.print("[cyan]Checking for updates...[/cyan]")
+    try:
+        url = "https://pypi.org/pypi/fluxmedia/json"
+        response = requests.get(url, timeout=2.0)
+        if response.status_code == 200:
+            data = response.json()
+            LATEST_VERSION = data.get("info", {}).get("version")
+            if is_version_ignored(LATEST_VERSION, config):
+                return
+            if is_new_version_available(CURRENT_VERSION, LATEST_VERSION):
+                console.print("\n[bold yellow]🔔 UPDATE AVAILABLE 🔔[/bold yellow]")
+                console.print(f"A new version of FluxMedia is available: [bold green]{LATEST_VERSION}[/bold green] (Current: {CURRENT_VERSION})")
+
+                console.print("\n[bold]Options:[/bold]")
+                console.print("1. Update Now")
+                console.print("2. Continue with Current Version")
+                console.print("3. Ignore This Version (don't ask again)")
+                choice = Prompt.ask("Choose an option", choices=["1", "2", "3"], default="2")
+                clear_screen()
+
+                if choice == "1":
+                    operation_update_fluxmedia()
+                    sys.exit(0)
+                elif choice == "3":
+                    ignored = config.get("ignored_versions", [])
+                    if not isinstance(ignored, list):
+                        ignored = []
+                    if LATEST_VERSION not in ignored:
+                        ignored.append(LATEST_VERSION)
+                    config["ignored_versions"] = ignored
+                    try:
+                        save_config(config)
+                    except Exception:
+                        pass
+                    console.print(f"[yellow]Version {LATEST_VERSION} will no longer be offered.[/yellow]")
+                else:
+                    console.print("[yellow]Continuing with current version...[/yellow]")
+                    import time
+                    time.sleep(1.0)
+    except Exception as e:
+        logger.warning(f"Failed sync update check: {e}")
+
+
+def get_default_download_dir() -> str:
+    """Get a sensible default downloads directory, supporting Termux/Android specific paths."""
+    # Embedded Android builds pass an app-scoped external folder. This must
+    # win over the Termux checks below, because a normal Android app cannot
+    # write to /sdcard without scoped-storage permissions.
+    override = os.environ.get("FLUXMEDIA_DOWNLOAD_DIR")
+    if override:
+        return os.path.abspath(os.path.expanduser(override))
+
+    home = os.path.expanduser("~")
+    
+    # Check if we are in Termux (Android)
+    if "ANDROID_ROOT" in os.environ or "TERMUX_VERSION" in os.environ:
+        candidate_paths = [
+            os.path.join(home, "storage", "shared", "Download", "FluxMediaDownloads"),
+            os.path.join(home, "storage", "shared", "Downloads", "FluxMediaDownloads"),
+            "/sdcard/Download/FluxMediaDownloads",
+            "/sdcard/Downloads/FluxMediaDownloads",
+            "/storage/emulated/0/Download/FluxMediaDownloads",
+            "/storage/emulated/0/Downloads/FluxMediaDownloads"
+        ]
+        for path in candidate_paths:
+            parent = os.path.dirname(path)
+            if os.path.exists(parent):
+                return os.path.abspath(path)
+        return "/sdcard/Download/FluxMediaDownloads"
+        
+    downloads = os.path.join(home, "Downloads", "FluxMedia")
+    # Fallback if Downloads folder doesn't exist
+    if not os.path.exists(os.path.join(home, "Downloads")):
+        downloads = os.path.join(home, "FluxMediaDownloads")
+    return os.path.abspath(downloads)
+
+DEFAULT_CONFIG = {
+    "download_dir": get_default_download_dir(),
+    "default_quality": "best",
+    "theme": "dark",
+    "filename_format": "%(title)s.%(ext)s",
+    "embed_metadata": True,
+    "embed_thumbnail": True,
+    "show_educational_notice": True,
+    "video_format": "default",
+    "audio_format": "mp3",
+    "cookies_browser": "none",
+    "embed_subtitles": False,
+    "audio_bitrate": "192",
+    "download_speed_limit": "disabled",
+    "web_auth_enabled": True,
+    "web_username": "admin",
+    "web_password": "admin",
+    "share_profile_name": "Admin",
+    "share_profile_photo": "",
+    "share_custom_path": "",
+    "share_link_ttl_minutes": 0,
+    "share_max_downloads": 0,
+    "share_pairing_confirm": False,
+    "save_history": True,
+    "auto_update": True,
+    "ffmpeg_path": "",
+    "watch_party_name": "",
+    "watch_party_sync_mode": "strict",
+    "clean_logs_enabled": True,
+    "plugins_disabled": [],
+    "update_interval": "weekly",
+    "last_update_check": 0.0,
+    "ignored_versions": [],
+    "subtitle_langs": "en",
+    "notify_on": "both",
+    "ntfy_url": "",
+    "watch_dir": "",
+    "watch_interval_seconds": 60,
+    "onboarded": False
+}
+
+def load_config() -> Dict[str, Any]:
+    """Loads settings from config.json or returns default configuration."""
+    if not os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(DEFAULT_CONFIG, f, indent=4, ensure_ascii=False)
+            _lock_down(CONFIG_FILE)
+            logger.info("Created default configuration file.")
+            return DEFAULT_CONFIG.copy()
+        except Exception as e:
+            logger.error(f"Failed to create config.json: {e}")
+            return DEFAULT_CONFIG.copy()
+    
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            config = json.load(f)
+            updated = False
+            for k, v in DEFAULT_CONFIG.items():
+                if k not in config:
+                    config[k] = v
+                    updated = True
+            if updated:
+                with open(CONFIG_FILE, "w", encoding="utf-8") as f_out:
+                    json.dump(config, f_out, indent=4, ensure_ascii=False)
+                _lock_down(CONFIG_FILE)
+            return config
+    except Exception as e:
+        logger.error(f"Failed to read config.json, returning defaults. Error: {e}")
+        try:
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(DEFAULT_CONFIG, f, indent=4, ensure_ascii=False)
+            _lock_down(CONFIG_FILE)
+            logger.info("Rewrote config.json with default configuration after loading failure.")
+        except Exception as write_err:
+            logger.error(f"Failed to self-heal config.json: {write_err}")
+        return DEFAULT_CONFIG.copy()
+
+def _lock_down(path: str) -> None:
+    """Restrict a sensitive file to owner-only (FIND-10: config holds the
+    web/share password in plaintext). Best-effort on platforms without
+    POSIX modes (Windows: no-op for ACLs, open() already defaults sane)."""
+    try:
+        os.chmod(path, 0o600)
+    except Exception:
+        pass
+
+
+def save_config(config: Dict[str, Any]) -> bool:
+    """Saves settings to config.json."""
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=4, ensure_ascii=False)
+        _lock_down(CONFIG_FILE)
+        logger.info("Saved configuration successfully.")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to save config.json: {e}")
+        return False
+
+def load_history() -> List[Dict[str, Any]]:
+    """Loads historical logs of downloads."""
+    if not os.path.exists(HISTORY_FILE):
+        return []
+    try:
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.error(f"Failed to load download history: {e}")
+        try:
+            with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+                json.dump([], f, indent=4, ensure_ascii=False)
+            logger.info("Rewrote history.json with empty list after loading failure.")
+        except Exception as write_err:
+            logger.error(f"Failed to self-heal history.json: {write_err}")
+        return []
+
+def save_history(history: List[Dict[str, Any]]) -> bool:
+    """Saves history list to history.json."""
+    try:
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(history, f, indent=4, ensure_ascii=False)
+        return True
+    except Exception as e:
+        logger.error(f"Failed to save history: {e}")
+        return False
+
+def add_history_entry(url: str, title: str, status: str, media_type: str, file_path: Optional[str] = None):
+    """Adds a new entry to the download history."""
+    history = load_history()
+    entry = {
+        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "url": url,
+        "title": title,
+        "status": status,
+        "type": media_type,
+        "file_path": file_path or "N/A"
+    }
+    history.insert(0, entry)
+    save_history(history[:100])  # Keep only the last 100 entries
+
+def load_queue() -> List[Dict[str, Any]]:
+    """Loads the download queue from queue.json."""
+    if not os.path.exists(QUEUE_FILE):
+        return []
+    try:
+        with open(QUEUE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.error(f"Failed to load queue.json: {e}")
+        return []
+
+def save_queue(queue: List[Dict[str, Any]]):
+    """Saves the download queue to queue.json."""
+    try:
+        with open(QUEUE_FILE, "w", encoding="utf-8") as f:
+            json.dump(queue, f, indent=4, ensure_ascii=False)
+    except Exception as e:
+        logger.error(f"Failed to save queue.json: {e}")
+
+def add_to_queue_interactive(config: Dict[str, Any], item_type: str):
+    """Prompts for input and adds a task to the queue."""
+    print_header()
+    console.print(f"\n[bold cyan]=== ADD {item_type.upper()} TO QUEUE ===[/bold cyan]\n")
+    
+    url = Prompt.ask("Enter URL").strip()
+    if not url:
+        console.print("[bold red]Error: No URL provided.[/bold red]")
+        Prompt.ask("\nPress Enter to return...")
+        return
+        
+    normalized = normalize_and_validate_url(url)
+    if not normalized:
+        console.print("[bold red]Error: Invalid URL format.[/bold red]")
+        Prompt.ask("\nPress Enter to return...")
+        return
+
+    quality = "best"
+    if item_type == "Video":
+        quality = prompt_video_quality()
+    
+    dest_dir = prompt_destination_dir(config["download_dir"])
+    if not dest_dir:
+        return
+    
+    queue = load_queue()
+    duplicates = [item for item in queue if normalize_url(item.get("url", "")) == normalize_url(normalized) and item["status"] in ("Pending", "Downloading") and item["type"] == item_type]
+    if duplicates:
+        console.print("[bold yellow]Warning: This URL is already in the queue as a pending/active task.[/bold yellow]")
+        if not Confirm.ask("Would you still like to add it?", default=False):
+            return
+    past = find_duplicate(normalized, queue=[])
+    if past is not None and past["where"] == "history":
+        entry = past["entry"]
+        console.print(f"[yellow]Already downloaded: {escape(entry.get('title') or normalized)} "
+                      f"({entry.get('timestamp', 'previously')}).[/yellow]")
+        if not Confirm.ask("Add it to the queue anyway?", default=False):
+            return
+            
+    next_id = max([item["id"] for item in queue], default=0) + 1
+    
+    new_item = {
+        "id": next_id,
+        "url": normalized,
+        "title": "",  # Will fetch title during processing
+        "type": item_type,
+        "quality": quality,
+        "dest_dir": dest_dir,
+        "status": "Pending",
+        "added_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+    
+    queue.append(new_item)
+    save_queue(queue)
+    console.print(f"\n[bold green]Successfully added to queue (ID: {next_id})![/bold green]")
+    Prompt.ask("\nPress Enter to continue...")
+
+def scan_watch_folder(config: Dict[str, Any]) -> int:
+    """One watch-folder pass: .txt files of URLs become Pending queue items.
+
+    Skips silently when watch_dir is unset/missing. Each .txt is moved to
+    done/ (URLs queued) or failed/ (nothing usable). Lines starting with #
+    are comments. Duplicate URLs are still queued (the downloader warns).
+    Returns the number of queued URLs. Never raises.
+    """
+    try:
+        from fluxmedia.utils import normalize_and_validate_url as _norm
+        watch = str((config or {}).get("watch_dir", "") or "").strip()
+        if not watch or not os.path.isdir(watch):
+            return 0
+        done_dir = os.path.join(watch, "done")
+        failed_dir = os.path.join(watch, "failed")
+        os.makedirs(done_dir, exist_ok=True)
+        os.makedirs(failed_dir, exist_ok=True)
+        queue = load_queue()
+        next_id = max([i.get("id", 0) for i in queue if isinstance(i, dict)], default=0) + 1
+        dest_dir = str(config.get("download_dir", "") or get_default_download_dir())
+        added = 0
+        for fname in sorted(os.listdir(watch)):
+            if not fname.endswith(".txt"):
+                continue
+            fpath = os.path.join(watch, fname)
+            if not os.path.isfile(fpath):
+                continue
+            try:
+                with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                    raw_lines = f.read().splitlines()
+            except OSError:
+                continue
+            urls = []
+            for line in raw_lines:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                norm = _norm(line)
+                if norm:
+                    urls.append(norm)
+            ok = bool(urls)
+            for u in urls:
+                queue.append({
+                    "id": next_id, "url": u, "title": "",
+                    "type": "Video", "quality": str(config.get("default_quality", "best")),
+                    "dest_dir": dest_dir, "status": "Pending",
+                    "added_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                })
+                next_id += 1
+                added += 1
+            try:
+                target = os.path.join(done_dir if ok else failed_dir, fname)
+                if os.path.exists(target):
+                    os.remove(target)
+                os.rename(fpath, target)
+            except OSError:
+                pass
+        if added:
+            save_queue(queue)
+        return added
+    except Exception as e:
+        logger.error(f"Watch folder scan failed: {e}")
+        return 0
+
+
+def recover_interrupted_queue() -> int:
+    """Crash recovery: tasks stuck in Downloading (killed process, crash,
+    power loss) can never finish on their own — re-queue them as Pending.
+
+    Returns the number of recovered tasks. Safe to call on every startup.
+    """
+    try:
+        queue = load_queue()
+    except Exception:
+        return 0
+    recovered = 0
+    for item in queue:
+        if isinstance(item, dict) and item.get("status") == "Downloading":
+            item["status"] = "Pending"
+            recovered += 1
+    if recovered:
+        try:
+            save_queue(queue)
+        except Exception:
+            pass
+        logger.info(f"Recovered {recovered} interrupted queue task(s) to Pending.")
+    return recovered
+
+
+def process_download_queue(config: Dict[str, Any]):
+    """Processes pending items in the download queue sequentially."""
+    print_header()
+    console.print("\n[bold cyan]=== PROCESSING DOWNLOAD QUEUE ===[/bold cyan]\n")
+    
+    queue = load_queue()
+    pending_items = [item for item in queue if item["status"] == "Pending"]
+    
+    if not pending_items:
+        console.print("[yellow]No pending tasks in the queue.[/yellow]")
+        Prompt.ask("\nPress Enter to return...")
+        return
+        
+    total = len(pending_items)
+    console.print(f"[bold green]Found {total} pending task(s) in queue.[/bold green]")
+    
+    ffmpeg_available = shutil.which("ffmpeg") is not None
+    successful_count = 0
+    failed_count = 0
+    last_dest_dir = config.get("download_dir", get_default_download_dir())
+    
+    try:
+        for idx, item in enumerate(pending_items, 1):
+            last_dest_dir = item.get("dest_dir", last_dest_dir)
+            # Refresh queue list from disk
+            queue = load_queue()
+            actual_item = next((x for x in queue if x["id"] == item["id"]), None)
+            if not actual_item or actual_item["status"] != "Pending":
+                continue
+                
+            actual_item["status"] = "Downloading"
+            save_queue(queue)
+            
+            console.print(f"\n[bold cyan]--- Processing Queue Task [{idx}/{total}] (ID: {item['id']}) ---[/bold cyan]")
+            console.print(f"[bold]URL:[/bold] {item['url']}")
+            
+            title = "Unknown"
+            try:
+                with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl:
+                    info = ydl.extract_info(item['url'], download=False)
+                    title = info.get('title', 'Unknown Title')
+                    actual_item["title"] = title
+                    save_queue(queue)
+                    console.print(f"[bold]Title:[/bold] {escape(title)}")
+            except Exception as e:
+                logger.warning(f"Could not retrieve video title beforehand: {e}")
+                console.print("[yellow]Could not fetch video info. Attempting download directly...[/yellow]")
+                
+            dest_dir = item["dest_dir"]
+            ydl_opts = {
+                'outtmpl': os.path.join(dest_dir, config["filename_format"]),
+                'quiet': True,
+                'no_warnings': True,
+                'noprogress': True,
+                # Resume partial/fragment downloads instead of restarting.
+                'continuedl': True,
+            }
+            
+            if item["type"] == "Video":
+                format_str = get_format_string(item["quality"], ffmpeg_available)
+                ydl_opts['format'] = format_str
+                pref_format = config.get("video_format", "default")
+                if pref_format != "default":
+                    ydl_opts['merge_output_format'] = pref_format
+                    
+                postprocessors = []
+                if ffmpeg_available:
+                    if config.get("embed_metadata", True):
+                        postprocessors.append({'key': 'FFmpegMetadata', 'add_metadata': True})
+                    if config.get("embed_thumbnail", True):
+                        ydl_opts['writethumbnails'] = True
+                        postprocessors.append({'key': 'FFmpegThumbnailsConvertor', 'format': 'jpg', 'when': 'before_dl'})
+                        postprocessors.append({'key': 'EmbedThumbnail', 'already_have_thumbnail': False})
+                if postprocessors:
+                    ydl_opts['postprocessors'] = postprocessors
+            else: # Audio
+                if ffmpeg_available:
+                    postprocessors = []
+                    pref_audio = config.get("audio_format", "mp3")
+                    if pref_audio != "default":
+                        postprocessors.append({
+                            'key': 'FFmpegExtractAudio',
+                            'preferredcodec': pref_audio,
+                            'preferredquality': config.get("audio_bitrate", "192"),
+                        })
+                    if config.get("embed_metadata", True):
+                        postprocessors.append({'key': 'FFmpegMetadata', 'add_metadata': True})
+                    if config.get("embed_thumbnail", True):
+                        ydl_opts['writethumbnails'] = True
+                        postprocessors.append({'key': 'FFmpegThumbnailsConvertor', 'format': 'jpg', 'when': 'before_dl'})
+                        postprocessors.append({'key': 'EmbedThumbnail', 'already_have_thumbnail': False})
+                    if postprocessors:
+                        ydl_opts['postprocessors'] = postprocessors
+                else:
+                    ydl_opts['format'] = 'bestaudio/best'
+
+            ydl_opts = apply_common_ydl_opts(ydl_opts, config)
+            
+            if item["type"] == "Video" and config.get("embed_subtitles", False) and ffmpeg_available:
+                ydl_opts.update({
+                    'writesubtitles': True,
+                    'writeautomaticsub': True,
+                    'subtitleslangs': parse_subtitle_langs(config.get("subtitle_langs", "en")),
+                    'embedsubtitles': True,
+                })
+                
+            success = run_ydl_download(ydl_opts, [item['url']])
+            
+            queue = load_queue()
+            actual_item = next((x for x in queue if x["id"] == item["id"]), None)
+            if actual_item:
+                if success:
+                    actual_item["status"] = "Completed"
+                    successful_count += 1
+                    add_history_entry(item['url'], title, "Success", item['type'], dest_dir)
+                else:
+                    actual_item["status"] = "Failed"
+                    failed_count += 1
+                    add_history_entry(item['url'], title, "Failed", item['type'])
+                save_queue(queue)
+                
+        summary_msg = f"Queue processing complete. {successful_count} succeeded, {failed_count} failed."
+        send_desktop_notification("FluxMedia Queue Complete", summary_msg)
+        console.print(f"\n[bold green]Queue processing complete! {successful_count} succeeded, {failed_count} failed.[/bold green]")
+    except KeyboardInterrupt:
+        if register_interrupt():
+            console.print("\n[bold green]Thank you for using FluxMedia! Goodbye.[/bold green]")
+            sys.exit(0)
+        # Mark currently downloading task as Failed
+        queue = load_queue()
+        actual_item = next((x for x in queue if x["status"] == "Downloading"), None)
+        if actual_item:
+            actual_item["status"] = "Failed"
+            save_queue(queue)
+        blink_warning()
+        send_desktop_notification("FluxMedia - Queue Interrupted", "Queue download was suspended.")
+        return
+
+def remove_from_queue_interactive():
+    """Prompts for a task ID and removes it from the queue."""
+    print_header()
+    console.print("\n[bold cyan]=== REMOVE ITEM FROM QUEUE ===[/bold cyan]\n")
+    
+    queue = load_queue()
+    if not queue:
+        console.print("[yellow]The download queue is currently empty.[/yellow]")
+        Prompt.ask("\nPress Enter to continue...")
+        return
+        
+    try:
+        task_id_str = Prompt.ask("Enter the Task ID to remove").strip()
+        task_id = int(task_id_str)
+    except ValueError:
+        console.print("[bold red]Error: Invalid numeric ID format.[/bold red]")
+        Prompt.ask("\nPress Enter to continue...")
+        return
+        
+    item_to_remove = next((x for x in queue if x["id"] == task_id), None)
+    if not item_to_remove:
+        console.print(f"[bold red]Error: No queue item found with ID {task_id}.[/bold red]")
+        Prompt.ask("\nPress Enter to continue...")
+        return
+        
+    queue = [x for x in queue if x["id"] != task_id]
+    save_queue(queue)
+    console.print(f"[bold green]Successfully removed item {task_id} from queue.[/bold green]")
+    Prompt.ask("\nPress Enter to continue...")
+
+def clear_finished_queue():
+    """Clears completed or failed tasks from the queue file."""
+    print_header()
+    console.print("\n[bold cyan]=== CLEAR FINISHED TASKS ===[/bold cyan]\n")
+    
+    queue = load_queue()
+    original_len = len(queue)
+    queue = [x for x in queue if x["status"] not in ("Completed", "Failed")]
+    save_queue(queue)
+    
+    cleared = original_len - len(queue)
+    console.print(f"[bold green]Cleared {cleared} finished task(s) from the queue.[/bold green]")
+    Prompt.ask("\nPress Enter to continue...")
+
+def reset_failed_tasks():
+    """Resets all Failed tasks in the queue to Pending so they can be processed again."""
+    print_header()
+    console.print("\n[bold cyan]=== RESET FAILED TASKS ===[/bold cyan]\n")
+    
+    queue = load_queue()
+    reset_count = 0
+    for item in queue:
+        if item.get("status") == "Failed":
+            item["status"] = "Pending"
+            reset_count += 1
+            
+    if reset_count > 0:
+        save_queue(queue)
+        console.print(f"[bold green]Successfully reset {reset_count} failed task(s) to Pending.[/bold green]")
+    else:
+        console.print("[yellow]No failed tasks found in the queue.[/yellow]")
+    Prompt.ask("\nPress Enter to continue...")
+
+def view_completed_queue_tasks():
+    """Displays only the completed tasks in the download queue."""
+    print_header()
+    console.print("\n[bold cyan]=== COMPLETED QUEUE DOWNLOADS ===[/bold cyan]\n")
+    
+    queue = load_queue()
+    completed_items = [item for item in queue if item.get("status") == "Completed"]
+    
+    if not completed_items:
+        console.print("[yellow]No completed tasks found in the queue.[/yellow]")
+        Prompt.ask("\nPress Enter to continue...")
+        return
+        
+    table = Table(title="Completed Queue Downloads", border_style="green")
+    table.add_column("ID", justify="center", style="bold cyan")
+    table.add_column("Type", justify="center", style="magenta")
+    table.add_column("Title / URL", justify="left", max_width=45, style="white")
+    table.add_column("Destination Directory", justify="left", max_width=45, style="dim white")
+    table.add_column("Quality", justify="center", style="green")
+    table.add_column("Added At", justify="center", style="dim gray")
+    
+    for item in completed_items:
+        display_title = item.get("title") or item["url"]
+        dest_dir = item.get("dest_dir", "N/A")
+        table.add_row(
+            str(item["id"]),
+            item["type"],
+            display_title,
+            dest_dir,
+            item["quality"],
+            item["added_at"]
+        )
+    console.print(table)
+    Prompt.ask("\nPress Enter to continue...")
+
