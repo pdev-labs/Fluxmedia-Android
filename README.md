@@ -13,9 +13,10 @@ server.
 
 - **Download** — paste a link, analyse it, pick a quality, watch live
   progress and logs.
-- **High-resolution video** — downloads H.264 video and AAC audio separately
-  and remuxes them on-device with Android's `MediaMuxer`. Typically up to
-  1080p without bundling FFmpeg.
+- **High-resolution video** — downloads the best video and audio streams and
+  merges them with bundled FFmpeg (up to the source's maximum resolution,
+  including VP9/AV1/MKV/WebM).
+- **MP3 and FLAC extraction** — bundled FFmpeg converts audio downloads.
 - **Automatic saving** — every finished download is copied to the public
   `Download/FluxMedia` folder and a toast shows the file name and final path.
 - **Library** — browse, search, open, share and delete files.
@@ -101,11 +102,21 @@ Then rebuild and commit.
 
 ## Limitations
 
-- FFmpeg is not bundled. MP3/FLAC extraction still needs a desktop build.
-  VP9/AV1-only streams (e.g. 1440p/4K on YouTube) fall back to the best
-  pre-muxed stream.
 - Downloads run inside the app process; there is no background service yet.
 - Some YouTube videos need a JavaScript runtime that is not bundled.
+- FFmpeg is bundled as static binaries, which makes the APK large
+  (~130 MB with both arm64-v8a and x86_64). The build is cached in CI.
+
+## FFmpeg
+
+`android/scripts/build-ffmpeg.sh` cross-compiles FFmpeg 7.1.1 and libmp3lame
+for both ABIs with the Android NDK. The CI workflow runs it once and caches
+`ffmpeg-out/`; the APK build then downloads those binaries into
+`android/app/src/main/jniLibs`.
+
+The app passes the native library directory to Python, which sets
+`FLUXMEDIA_FFMPEG` to `libffmpeg.so`. yt-dlp finds `libffprobe.so` beside it
+automatically. FFmpeg and libmp3lame are LGPL; see `THIRD_PARTY_NOTICES.md`.
 
 ## Licence
 

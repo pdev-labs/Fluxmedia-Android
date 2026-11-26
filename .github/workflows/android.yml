@@ -17,8 +17,41 @@ on:
 permissions:
   contents: read
 
+env:
+  FFMPEG_VERSION: "7.1.1"
+  LAME_VERSION: "3.100"
+
 jobs:
+  ffmpeg:
+    name: Build FFmpeg (arm64 + x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache FFmpeg binaries
+        id: ffmpeg-cache
+        uses: actions/cache@v4
+        with:
+          path: ffmpeg-out
+          key: ffmpeg-android-${{ env.FFMPEG_VERSION }}-${{ env.LAME_VERSION }}-${{ hashFiles('android/scripts/build-ffmpeg.sh') }}
+
+      - name: Build FFmpeg
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        run: |
+          chmod +x android/scripts/build-ffmpeg.sh
+          ./android/scripts/build-ffmpeg.sh
+
+      - name: Upload FFmpeg binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-jniLibs
+          path: ffmpeg-out
+          if-no-files-found: error
+          retention-days: 30
+
   build:
+    name: Build signed APK
+    needs: ffmpeg
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -33,6 +66,16 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Download FFmpeg binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: ffmpeg-jniLibs
+          path: android/app/src/main/jniLibs
+
+      - name: Verify FFmpeg binaries
+        run: |
+          find android/app/src/main/jniLibs -type f -exec ls -lh {} \;
 
       # GitHub's ubuntu-latest image already includes the Android SDK and
       # ANDROID_HOME. Do not use android-actions/setup-android@v3: it tries
