@@ -1,7 +1,11 @@
-# FluxMedia for Android (Beta)
+<div align="center">
+  <img src="docs/icon.png" alt="FluxMedia icon" width="112" height="112" />
 
-[![Latest release](https://img.shields.io/github/v/release/pdev-labs/Fluxmedia-Android?label=release&style=flat-square)](https://github.com/pdev-labs/Fluxmedia-Android/releases)
-[![Licence](https://img.shields.io/badge/licence-GPL--3.0-blue?style=flat-square)](LICENSE)
+  # FluxMedia for Android (Beta)
+
+  [![Latest release](https://img.shields.io/github/v/release/pdev-labs/Fluxmedia-Android?label=release&style=flat-square)](https://github.com/pdev-labs/Fluxmedia-Android/releases)
+  [![Licence](https://img.shields.io/badge/licence-GPL--3.0-blue?style=flat-square)](LICENSE)
+</div>
 
 A native Android app for [FluxMedia](https://github.com/pdev-labs/FluxMedia),
 written in **Kotlin** with **Jetpack Compose** and **Material You** dynamic
