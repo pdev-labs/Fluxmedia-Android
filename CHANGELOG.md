@@ -4,6 +4,14 @@ All notable changes to FluxMedia for Android are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] — 2026-11-27
+
+### Changed
+
+- New **Flux Swoosh** launcher icon, adaptive icon, round icon and legacy mipmaps.
+- Launcher background is now Ink Navy (`#071A2F`) with a white play shape and cyan wake.
+- Brand assets and guidelines now live in the main repository under `brand/`.
+
 ## [1.0.0] — 2026-11-26 · Beta
 
 First public Android release.
@@ -38,4 +46,5 @@ First public Android release.
 - No background download service yet.
 - Some YouTube videos need a JavaScript runtime that is not bundled.
 
+[1.0.1]: https://github.com/pdev-labs/Fluxmedia-Android/releases/tag/android-v1.0.1
 [1.0.0]: https://github.com/pdev-labs/Fluxmedia-Android/releases/tag/android-v1.0.0

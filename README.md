@@ -7,9 +7,9 @@ A native Android app for [FluxMedia](https://github.com/pdev-labs/FluxMedia),
 written in **Kotlin** with **Jetpack Compose** and **Material You** dynamic
 colour.
 
-> **Version 1.0.0 is the first release and is still in beta.** Features may
-> change and some sites need a JavaScript runtime that is not bundled yet.
-> Please report issues on the
+> **Version 1.0.1 is the current beta release (1.0.0 was the first public beta).**
+> Features may change and some sites need a JavaScript runtime that is not
+> bundled yet. Please report issues on the
 > [issue tracker](https://github.com/pdev-labs/Fluxmedia-Android/issues).
 
 The app embeds the FluxMedia Python downloader with
@@ -32,6 +32,8 @@ Requires Android 7.0 (API 24) or newer and a 64-bit device (`arm64-v8a`, or
 
 > The release key differs from the debug key, so uninstall a debug build
 > before installing the signed release for the first time.
+
+The launcher icon is the **Flux Swoosh** mark. The full logo kit, colour palette and guidelines live in the main repository: [FluxMedia brand assets](https://github.com/pdev-labs/FluxMedia/tree/main/brand).
 
 ## Features
 
@@ -71,7 +73,7 @@ The Android app and the Python engine are versioned separately:
 
 | Component | Version |
 | --- | --- |
-| Android app | 1.0.0 (first public beta) |
+| Android app | 1.0.1 (beta) |
 | Python engine | 1.18.1 |
 
 The About screen shows both.
